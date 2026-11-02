@@ -24,11 +24,27 @@
 //! - 固定長(343,980サンプル)単位のチャンクに分けて処理し、最後の端数はゼロ埋めする
 //!   (Demucs本来のオーバーラップ加算によるクロスフェードは行わないため、チャンクの
 //!   境目でごく僅かな不連続が生じ得る近似)。
+//!
+//! ## GPU高速化(2026-09-28新設、DirectML)
+//! Windowsでは、`ort`(Microsoft ONNXRuntimeのRustバインディング。C++実装のネイティブ
+//! ライブラリを実行時に読み込むだけで、Pythonは使わない)経由でDirectML(AMD/NVIDIA/Intelを
+//! 問わないWindows標準のGPUアクセラレーションAPI)を試す。GPUが無い/対応しない/
+//! DirectMLの初期化に失敗する環境では、既存の`tract`(純Rust、CPU)推論へ自動的に
+//! フォールバックする(`rife-ncnn-vulkan`のGPU失敗時CPUフォールバックと同じ設計)。
+//! **正直な開示**: このGPU経路は、この開発機のGPU(GT 730、2026年時点で非常に旧式)では
+//! 実際の高速化を測定できていない(ビルドは通るが、実機での速度・安定性の検証は
+//! 将来もっと新しいGPUを用意してから行う必要がある、次回課題)。
 
 use std::path::{Path, PathBuf};
 use tract_onnx::prelude::*;
 
 use crate::engine::convert::ChannelLayoutTarget;
+
+/// 1チャンク分の推論を行うバックエンド(CPU=tract、GPU=ort/DirectML)の共通インタフェース。
+trait UpmixBackend {
+    fn run_chunk(&self, left: &[f32], right: &[f32]) -> Result<[[Vec<f32>; 2]; 4], String>;
+    fn label(&self) -> &'static str;
+}
 
 /// パッチ済みモデルが1回に処理する固定入力長(サンプル数、44.1kHz換算で約7.8秒)。
 /// `tools/demucs-onnx-patch/patch_htdemucs_onnx.py`の`FIXED_INPUT_SAMPLES`と一致させること。
@@ -58,37 +74,68 @@ pub fn is_available() -> bool {
 
 type Plan = TypedRunnableModel<TypedModel>;
 
-fn load_model() -> Result<Plan, String> {
-    let path = model_path().ok_or("AIアップミックスのモデルが見つかりません(MAKE_DISK_DEMUCS_MODEL_DIRを確認してください)")?;
-    tract_onnx::onnx()
-        .model_for_path(&path)
-        .and_then(|m| m.into_optimized())
-        .and_then(|m| m.into_runnable())
-        .map_err(|e| format!("AIアップミックスのモデルを読み込めません: {e}"))
+struct TractBackend {
+    plan: Plan,
 }
 
-/// 1チャンク分(ちょうど[`CHUNK_SAMPLES`]サンプル、ステレオ)を推論し、
-/// `[drums, bass, other, vocals]`の4ステム(各ステレオ)を返す。
-fn separate_chunk(plan: &Plan, left: &[f32], right: &[f32]) -> Result<[[Vec<f32>; 2]; 4], String> {
-    debug_assert_eq!(left.len(), CHUNK_SAMPLES);
-    debug_assert_eq!(right.len(), CHUNK_SAMPLES);
-    let mut data = vec![0f32; 2 * CHUNK_SAMPLES];
-    data[..CHUNK_SAMPLES].copy_from_slice(left);
-    data[CHUNK_SAMPLES..].copy_from_slice(right);
-    let input = tract_ndarray::Array3::from_shape_vec((1, 2, CHUNK_SAMPLES), data).map_err(|e| e.to_string())?.into_tensor();
-    let result = plan.run(tvec!(input.into())).map_err(|e| format!("推論に失敗しました: {e}"))?;
-    let out = result[0].to_array_view::<f32>().map_err(|e| e.to_string())?;
-    // 出力shape: [1, 4, 2, CHUNK_SAMPLES]
-    let mut stems: [[Vec<f32>; 2]; 4] = std::array::from_fn(|_| [Vec::new(), Vec::new()]);
-    for (s, stem) in stems.iter_mut().enumerate() {
-        for (c, ch) in stem.iter_mut().enumerate() {
-            ch.reserve(CHUNK_SAMPLES);
-            for t in 0..CHUNK_SAMPLES {
-                ch.push(out[[0, s, c, t]]);
+impl TractBackend {
+    fn load() -> Result<Self, String> {
+        let path = model_path().ok_or("AIアップミックスのモデルが見つかりません(MAKE_DISK_DEMUCS_MODEL_DIRを確認してください)")?;
+        let plan = tract_onnx::onnx()
+            .model_for_path(&path)
+            .and_then(|m| m.into_optimized())
+            .and_then(|m| m.into_runnable())
+            .map_err(|e| format!("AIアップミックスのモデルを読み込めません: {e}"))?;
+        Ok(TractBackend { plan })
+    }
+}
+
+impl UpmixBackend for TractBackend {
+    fn label(&self) -> &'static str {
+        "CPU(tract)"
+    }
+
+    /// 1チャンク分(ちょうど[`CHUNK_SAMPLES`]サンプル、ステレオ)を推論し、
+    /// `[drums, bass, other, vocals]`の4ステム(各ステレオ)を返す。
+    fn run_chunk(&self, left: &[f32], right: &[f32]) -> Result<[[Vec<f32>; 2]; 4], String> {
+        debug_assert_eq!(left.len(), CHUNK_SAMPLES);
+        debug_assert_eq!(right.len(), CHUNK_SAMPLES);
+        let mut data = vec![0f32; 2 * CHUNK_SAMPLES];
+        data[..CHUNK_SAMPLES].copy_from_slice(left);
+        data[CHUNK_SAMPLES..].copy_from_slice(right);
+        let input = tract_ndarray::Array3::from_shape_vec((1, 2, CHUNK_SAMPLES), data).map_err(|e| e.to_string())?.into_tensor();
+        let result = self.plan.run(tvec!(input.into())).map_err(|e| format!("推論に失敗しました: {e}"))?;
+        let out = result[0].to_array_view::<f32>().map_err(|e| e.to_string())?;
+        // 出力shape: [1, 4, 2, CHUNK_SAMPLES]
+        let mut stems: [[Vec<f32>; 2]; 4] = std::array::from_fn(|_| [Vec::new(), Vec::new()]);
+        for (s, stem) in stems.iter_mut().enumerate() {
+            for (c, ch) in stem.iter_mut().enumerate() {
+                ch.reserve(CHUNK_SAMPLES);
+                for t in 0..CHUNK_SAMPLES {
+                    ch.push(out[[0, s, c, t]]);
+                }
+            }
+        }
+        Ok(stems)
+    }
+}
+
+/// 利用可能なバックエンドを選ぶ: Windowsではまずort/DirectML(GPU)を試し、失敗すれば
+/// tract(CPU)へフォールバックする。Windows以外は常にtract(CPU)。
+fn load_backend() -> Result<Box<dyn UpmixBackend>, String> {
+    #[cfg(windows)]
+    {
+        match gpu::OrtDirectMlBackend::load() {
+            Ok(b) => {
+                eprintln!("make-disk: AIアップミックスをGPU(DirectML)で実行します");
+                return Ok(Box::new(b));
+            }
+            Err(e) => {
+                eprintln!("make-disk: AIアップミックスのGPU(DirectML)初期化に失敗したため、CPUで実行します: {e}");
             }
         }
     }
-    Ok(stems)
+    Ok(Box::new(TractBackend::load()?))
 }
 
 /// 入力(任意長・任意チャンネル数)を、[`CHUNK_SAMPLES`]単位のステレオチャンクに分けて
@@ -102,7 +149,8 @@ fn separate_all(sr: u32, channels: &[Vec<f32>]) -> Result<[[Vec<f32>; 2]; 4], St
         1 => (channels[0].clone(), channels[0].clone()),
         _ => (channels[0].clone(), channels[1].clone()),
     };
-    let plan = load_model()?;
+    let backend = load_backend()?;
+    eprintln!("make-disk: AIアップミックス バックエンド: {}", backend.label());
     let mut stems: [Vec<Vec<f32>>; 4] = std::array::from_fn(|_| vec![Vec::with_capacity(total), Vec::with_capacity(total)]);
     let mut pos = 0usize;
     while pos < total.max(1) {
@@ -111,7 +159,7 @@ fn separate_all(sr: u32, channels: &[Vec<f32>]) -> Result<[[Vec<f32>; 2]; 4], St
         let mut chunk_r = vec![0f32; CHUNK_SAMPLES];
         chunk_l[..end - pos].copy_from_slice(&left[pos..end]);
         chunk_r[..end - pos].copy_from_slice(&right[pos..end]);
-        let separated = separate_chunk(&plan, &chunk_l, &chunk_r)?;
+        let separated = backend.run_chunk(&chunk_l, &chunk_r)?;
         let keep = end - pos;
         for (s, stem) in separated.into_iter().enumerate() {
             stems[s][0].extend_from_slice(&stem[0][..keep]);
@@ -123,6 +171,64 @@ fn separate_all(sr: u32, channels: &[Vec<f32>]) -> Result<[[Vec<f32>; 2]; 4], St
         }
     }
     Ok(stems.map(|s| [s[0].clone(), s[1].clone()]))
+}
+
+/// GPU(DirectML経由のort)バックエンド。Windows専用。
+#[cfg(windows)]
+mod gpu {
+    use super::{model_path, CHUNK_SAMPLES};
+    use ort::ep::DirectML;
+    use ort::session::{builder::GraphOptimizationLevel, Session};
+    use ort::value::Tensor;
+    use std::sync::Mutex;
+
+    pub struct OrtDirectMlBackend {
+        // Session::run()は&mut selfを要求するが、UpmixBackendトレイトは&selfで
+        // 呼ばれる(チャンクを順に処理するだけで並行実行はしないため、Mutexで足りる)。
+        session: Mutex<Session>,
+    }
+
+    impl OrtDirectMlBackend {
+        pub fn load() -> Result<Self, String> {
+            let path = model_path().ok_or("AIアップミックスのモデルが見つかりません")?;
+            let session = Session::builder()
+                .map_err(|e| e.to_string())?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| e.to_string())?
+                .with_execution_providers([DirectML::default().build()])
+                .map_err(|e| e.to_string())?
+                .commit_from_file(&path)
+                .map_err(|e| format!("DirectMLセッションを作れません: {e}"))?;
+            Ok(OrtDirectMlBackend { session: Mutex::new(session) })
+        }
+    }
+
+    impl super::UpmixBackend for OrtDirectMlBackend {
+        fn label(&self) -> &'static str {
+            "GPU(DirectML)"
+        }
+
+        fn run_chunk(&self, left: &[f32], right: &[f32]) -> Result<[[Vec<f32>; 2]; 4], String> {
+            let mut data = vec![0f32; 2 * CHUNK_SAMPLES];
+            data[..CHUNK_SAMPLES].copy_from_slice(left);
+            data[CHUNK_SAMPLES..].copy_from_slice(right);
+            let input = Tensor::from_array(([1usize, 2, CHUNK_SAMPLES], data)).map_err(|e| e.to_string())?;
+            let mut session = self.session.lock().map_err(|e| e.to_string())?;
+            let outputs = session.run(ort::inputs!["mix" => input]).map_err(|e| format!("GPU推論に失敗しました: {e}"))?;
+            let (shape, out) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+            let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+            let stride_s = dims[2] * dims[3];
+            let stride_c = dims[3];
+            let mut stems: [[Vec<f32>; 2]; 4] = std::array::from_fn(|_| [Vec::new(), Vec::new()]);
+            for (s, stem) in stems.iter_mut().enumerate() {
+                for (c, ch) in stem.iter_mut().enumerate() {
+                    let start = s * stride_s + c * stride_c;
+                    ch.extend_from_slice(&out[start..start + CHUNK_SAMPLES]);
+                }
+            }
+            Ok(stems)
+        }
+    }
 }
 
 fn stem_index(name: &str) -> usize {
